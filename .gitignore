@@ -1,0 +1,5 @@
+/target/
+*.pdf.spv.json
+*.pdf.spv.json.bak
+*.pdf.spv.json.tmp
+
