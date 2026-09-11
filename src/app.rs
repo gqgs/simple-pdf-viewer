@@ -26,6 +26,8 @@ const KEYBOARD_SCROLL_STEP: f32 = 96.0;
 // Fractional window and desktop scales otherwise force the GPU to interpolate a texture rendered
 // at almost exactly its display size, which noticeably softens small glyphs.
 const RENDER_OVERSAMPLE: f32 = 1.5;
+const ADJACENT_PREFETCH_RADIUS: usize = 2;
+const CONTINUOUS_PREFETCH_SCREENS: f32 = 2.5;
 const MAX_RENDER_PIXELS: f64 = 24_000_000.0;
 const MAX_TEXTURE_SIDE: f64 = 8_192.0;
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(110);
@@ -320,7 +322,7 @@ impl PdfViewerApp {
                         .truncate(if self.layout == LayoutMode::Continuous {
                             12
                         } else {
-                            3
+                            7
                         });
                 }
                 PdfResponse::PreviewRendered {
@@ -1106,7 +1108,8 @@ impl PdfViewerApp {
             ui.scroll_with_delta(keyboard_scroll_delta);
             ui.set_min_size(vec2(canvas_width, canvas_height));
             let origin = ui.min_rect().min;
-            let prefetch_viewport = viewport.expand2(vec2(0.0, viewport.height()));
+            let prefetch_viewport =
+                viewport.expand2(vec2(0.0, viewport.height() * CONTINUOUS_PREFETCH_SCREENS));
 
             for (page_index, display_size) in display_sizes.iter().copied().enumerate() {
                 let page_min = origin
@@ -1141,7 +1144,14 @@ impl PdfViewerApp {
                 }
 
                 let key = render_key(generation, page_index, display_size, ctx.pixels_per_point());
-                requested_renders.push(key);
+                let distance = if logical_page_rect.bottom() < viewport.top() {
+                    viewport.top() - logical_page_rect.bottom()
+                } else if logical_page_rect.top() > viewport.bottom() {
+                    logical_page_rect.top() - viewport.bottom()
+                } else {
+                    0.0
+                };
+                requested_renders.push((distance, key));
                 let cache = self
                     .page_cache
                     .iter()
@@ -1237,7 +1247,8 @@ impl PdfViewerApp {
             self.selected_annotation = None;
         }
 
-        for key in requested_renders {
+        requested_renders.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+        for (_, key) in requested_renders {
             self.request_render(key);
         }
         if !interactions
@@ -1518,6 +1529,32 @@ impl PdfViewerApp {
         }
     }
 
+    fn prefetch_single_adjacent(&mut self, ctx: &egui::Context) {
+        let Some(current_key) = self.desired_render else {
+            return;
+        };
+        // Never let speculative work delay the page the user is currently waiting for.
+        if !self.page_cache.iter().any(|entry| entry.key == current_key) {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let generation = document.generation;
+        let page_sizes = document.page_sizes.clone();
+        for page_index in adjacent_page_order(
+            self.current_page,
+            page_sizes.len(),
+            ADJACENT_PREFETCH_RADIUS,
+        ) {
+            let page_size = page_sizes[page_index];
+            let scale = self.display_scale(page_size, self.last_viewport);
+            let display_size = vec2(page_size[0] * scale, page_size[1] * scale);
+            let key = render_key(generation, page_index, display_size, ctx.pixels_per_point());
+            self.request_render(key);
+        }
+    }
+
     fn save_annotations(&mut self, ctx: &egui::Context) {
         let mut error = None;
         let mut dirty = false;
@@ -1546,6 +1583,7 @@ impl eframe::App for PdfViewerApp {
         self.hover_preview(&ctx);
         if self.layout == LayoutMode::SinglePage {
             self.send_render_if_due();
+            self.prefetch_single_adjacent(&ctx);
         }
         self.save_annotations(&ctx);
 
@@ -1640,6 +1678,22 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn adjacent_page_order(current: usize, page_count: usize, radius: usize) -> Vec<usize> {
+    let mut pages = Vec::with_capacity(radius.saturating_mul(2));
+    for distance in 1..=radius {
+        if let Some(next) = current
+            .checked_add(distance)
+            .filter(|page| *page < page_count)
+        {
+            pages.push(next);
+        }
+        if let Some(previous) = current.checked_sub(distance) {
+            pages.push(previous);
+        }
+    }
+    pages
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1662,6 +1716,13 @@ mod tests {
     fn render_size_includes_quality_margin() {
         let key = render_key(1, 0, vec2(800.0, 1_000.0), 1.0);
         assert_eq!(key.pixel_size, [1_200, 1_500]);
+    }
+
+    #[test]
+    fn adjacent_pages_prioritize_nearest_and_forward() {
+        assert_eq!(adjacent_page_order(3, 8, 2), vec![4, 2, 5, 1]);
+        assert_eq!(adjacent_page_order(0, 3, 2), vec![1, 2]);
+        assert_eq!(adjacent_page_order(2, 3, 2), vec![1, 0]);
     }
 
     #[test]

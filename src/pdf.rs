@@ -639,7 +639,72 @@ pub fn render_cache_hash(page_index: usize, pixel_size: [usize; 2]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
+
+    struct TestPdf(PathBuf);
+
+    impl TestPdf {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "simple-pdf-viewer-fixture-{}.pdf",
+                std::process::id()
+            ));
+            std::fs::write(&path, fixture_pdf_bytes()).expect("write generated PDF fixture");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPdf {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn fixture_pdf_bytes() -> Vec<u8> {
+        let first_text = "BT /F1 18 Tf 72 700 Td (Fixture first page) Tj ET";
+        let second_text = "BT /F1 18 Tf 72 700 Td (Fixture destination page) Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots [7 0 R] >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{first_text}\nendstream", first_text.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 8 0 R >>".to_owned(),
+            "<< /Type /Annot /Subtype /Link /Rect [72 680 250 715] /Border [0 0 0] /Dest [6 0 R /XYZ 72 720 null] >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{second_text}\nendstream", second_text.len()),
+        ];
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            write!(&mut pdf, "{} 0 obj\n{}\nendobj\n", index + 1, object)
+                .expect("write PDF object");
+        }
+        let xref_offset = pdf.len();
+        write!(
+            &mut pdf,
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        )
+        .expect("write PDF xref header");
+        for offset in offsets {
+            writeln!(&mut pdf, "{offset:010} 00000 n ").expect("write PDF xref entry");
+        }
+        write!(
+            &mut pdf,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .expect("finish PDF fixture");
+        pdf
+    }
 
     #[test]
     fn preview_keys_are_stable_and_quantized() {
@@ -657,13 +722,14 @@ mod tests {
     }
 
     #[test]
-    fn sample_pdf_supports_rendering_links_previews_and_selection() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample.pdf");
-        let (state, response) = load_document(7, &path).expect("sample PDF should load");
+    fn generated_pdf_supports_rendering_links_previews_and_selection() {
+        let fixture = TestPdf::new();
+        let (state, response) =
+            load_document(7, fixture.path()).expect("generated PDF should load");
         let PdfResponse::Loaded { page_sizes, .. } = response else {
             panic!("expected a loaded response");
         };
-        assert_eq!(page_sizes.len(), 53);
+        assert_eq!(page_sizes.len(), 2);
 
         let first_page = state.document.page(0).expect("first page");
         let image = render_full_page(&first_page, [320, 452]).expect("first page should render");
@@ -678,16 +744,16 @@ mod tests {
 
         let (text, rects) = resolve_selection(&state.document, 0, [0.0, 0.0], [1.0, 1.0])
             .expect("selection should resolve");
-        assert!(text.contains("Ingressing Minds"));
+        assert!(text.contains("Fixture first page"));
         assert!(!rects.is_empty());
 
-        let title_start = [0.06, 0.135];
-        let title_end = [0.86, 0.185];
+        let title_start = [0.1, 0.08];
+        let title_end = [0.55, 0.15];
         for (start, end) in [(title_start, title_end), (title_end, title_start)] {
             let (title, title_rects) = resolve_selection(&state.document, 0, start, end)
                 .expect("directed title selection should resolve");
-            assert!(title.contains("Ingressing Minds"));
-            assert!(!title.contains("Abstract"));
+            assert!(title.contains("Fixture first page"));
+            assert!(!title.contains("destination"));
             assert!(!title_rects.is_empty());
         }
 
@@ -702,7 +768,8 @@ mod tests {
                         LinkTarget::Uri(_) => None,
                     })
             })
-            .expect("sample PDF should contain an internal link");
+            .expect("generated PDF should contain an internal link");
+        assert_eq!(internal_destination.page_index, 1);
         let preview = render_preview(&state.document, &internal_destination, 1.0)
             .expect("internal destination should render a preview");
         assert_eq!([preview.width, preview.height], [420, 260]);
