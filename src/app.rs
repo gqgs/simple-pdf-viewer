@@ -5,8 +5,8 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Align2, Color32, ColorImage, CursorIcon, Id, Key, Layout, Modifiers, OpenUrl,
-    Order, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2, pos2, vec2,
+    self, Align, Align2, Color32, ColorImage, CursorIcon, Id, Key, Modifiers, OpenUrl, Order,
+    PointerButton, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 
 use crate::{
@@ -21,6 +21,7 @@ const PDF_POINT_TO_LOGICAL: f32 = 96.0 / 72.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
 const PAGE_MARGIN: f32 = 24.0;
+const PAGE_GAP: f32 = 18.0;
 const MAX_RENDER_PIXELS: f64 = 24_000_000.0;
 const MAX_TEXTURE_SIDE: f64 = 8_192.0;
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(110);
@@ -34,11 +35,19 @@ enum ZoomMode {
     FitPage,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LayoutMode {
+    #[default]
+    SinglePage,
+    Continuous,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ViewLocation {
     page_index: usize,
     scroll: Vec2,
     zoom: ZoomMode,
+    layout: LayoutMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -71,6 +80,14 @@ struct SelectionDraft {
     rects: Vec<NormalizedRect>,
 }
 
+#[derive(Clone, Copy)]
+enum SelectionAction {
+    Copy,
+    Highlight,
+    AddNote,
+    Clear,
+}
+
 struct HoverState {
     target: LinkTarget,
     started: Instant,
@@ -90,9 +107,11 @@ pub struct PdfViewerApp {
     current_page: usize,
     page_input: String,
     zoom: ZoomMode,
+    layout: LayoutMode,
     last_viewport: Vec2,
     current_scroll: Vec2,
     pending_scroll: Option<Vec2>,
+    pending_page_scroll: Option<usize>,
     pending_destination: Option<Destination>,
     back_history: Vec<ViewLocation>,
     forward_history: Vec<ViewLocation>,
@@ -105,6 +124,7 @@ pub struct PdfViewerApp {
     hover: Option<HoverState>,
     drag_start: Option<[f32; 2]>,
     drag_current: Option<[f32; 2]>,
+    drag_page: Option<usize>,
     selection_request: u64,
     selection_waiting: Option<u64>,
     selection_draft: Option<SelectionDraft>,
@@ -119,6 +139,7 @@ impl PdfViewerApp {
         cc.egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
             style.spacing.button_padding = vec2(8.0, 5.0);
             style.visuals.panel_fill = Color32::from_rgb(35, 37, 42);
+            style.scroll_animation = egui::style::ScrollAnimation::duration(0.18);
         });
         let mut app = Self {
             backend: PdfBackend::new(),
@@ -128,9 +149,11 @@ impl PdfViewerApp {
             current_page: 0,
             page_input: "1".into(),
             zoom: ZoomMode::FitPage,
+            layout: LayoutMode::SinglePage,
             last_viewport: vec2(900.0, 700.0),
             current_scroll: Vec2::ZERO,
             pending_scroll: None,
+            pending_page_scroll: None,
             pending_destination: None,
             back_history: Vec::new(),
             forward_history: Vec::new(),
@@ -143,6 +166,7 @@ impl PdfViewerApp {
             hover: None,
             drag_start: None,
             drag_current: None,
+            drag_page: None,
             selection_request: 0,
             selection_waiting: None,
             selection_draft: None,
@@ -214,6 +238,7 @@ impl PdfViewerApp {
                     self.zoom = ZoomMode::FitPage;
                     self.current_scroll = Vec2::ZERO;
                     self.pending_scroll = Some(Vec2::ZERO);
+                    self.pending_page_scroll = None;
                     self.pending_destination = None;
                     self.back_history.clear();
                     self.forward_history.clear();
@@ -285,7 +310,12 @@ impl PdfViewerApp {
                         texture,
                         links,
                     });
-                    self.page_cache.truncate(3);
+                    self.page_cache
+                        .truncate(if self.layout == LayoutMode::Continuous {
+                            12
+                        } else {
+                            3
+                        });
                 }
                 PdfResponse::PreviewRendered {
                     generation,
@@ -321,6 +351,10 @@ impl PdfViewerApp {
                                 text,
                                 rects,
                             });
+                            self.set_status(
+                                "Text selected — right-click it for Copy, Highlight, or Add note.",
+                                false,
+                            );
                         }
                     }
                 }
@@ -352,6 +386,7 @@ impl PdfViewerApp {
             page_index: self.current_page,
             scroll: self.current_scroll,
             zoom: self.zoom,
+            layout: self.layout,
         }
     }
 
@@ -362,7 +397,13 @@ impl PdfViewerApp {
         }
         self.current_page = page_index.min(page_count - 1);
         self.page_input = (self.current_page + 1).to_string();
-        self.pending_scroll = Some(Vec2::ZERO);
+        if self.layout == LayoutMode::Continuous {
+            self.pending_page_scroll = Some(self.current_page);
+            self.pending_scroll = None;
+        } else {
+            self.pending_scroll = Some(Vec2::ZERO);
+            self.pending_page_scroll = None;
+        }
         self.pending_destination = None;
         self.forward_history.clear();
         self.selection_draft = None;
@@ -377,6 +418,7 @@ impl PdfViewerApp {
         self.page_input = (self.current_page + 1).to_string();
         self.pending_destination = Some(destination);
         self.pending_scroll = None;
+        self.pending_page_scroll = None;
         self.selection_draft = None;
         self.selected_annotation = None;
         self.schedule_render(true);
@@ -400,7 +442,13 @@ impl PdfViewerApp {
         self.current_page = location.page_index.min(self.page_count().saturating_sub(1));
         self.page_input = (self.current_page + 1).to_string();
         self.zoom = location.zoom;
-        self.pending_scroll = Some(location.scroll);
+        if self.layout == location.layout {
+            self.pending_scroll = Some(location.scroll);
+        } else {
+            self.pending_page_scroll = Some(self.current_page);
+            self.pending_scroll = None;
+        }
+        self.layout = location.layout;
         self.pending_destination = None;
         self.selection_draft = None;
         self.schedule_render(true);
@@ -506,140 +554,189 @@ impl PdfViewerApp {
 
     fn toolbar(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::top("toolbar").show(root_ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("Open…")
-                    .on_hover_text("Open PDF (Ctrl+O)")
-                    .clicked()
-                {
-                    self.choose_file();
-                }
-                ui.separator();
+            let compact = ui.available_width() < 900.0;
+            egui::ScrollArea::horizontal()
+                .id_salt("toolbar-scroll")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Open…")
+                            .on_hover_text("Open PDF (Ctrl+O)")
+                            .clicked()
+                        {
+                            self.choose_file();
+                        }
+                        ui.separator();
 
-                let has_document = self.document.is_some();
-                if ui
-                    .add_enabled(!self.back_history.is_empty(), egui::Button::new("← Back"))
-                    .on_hover_text("Return from a followed reference (Alt+Left)")
-                    .clicked()
-                {
-                    self.navigate_back();
-                }
-                if ui
-                    .add_enabled(
-                        !self.forward_history.is_empty(),
-                        egui::Button::new("Forward →"),
-                    )
-                    .on_hover_text("Go forward again (Alt+Right)")
-                    .clicked()
-                {
-                    self.navigate_forward();
-                }
-                ui.separator();
+                        let has_document = self.document.is_some();
+                        if ui
+                            .add_enabled(
+                                !self.back_history.is_empty(),
+                                egui::Button::new(if compact { "↶" } else { "← Back" }),
+                            )
+                            .on_hover_text("Return from a followed reference (Alt+Left)")
+                            .clicked()
+                        {
+                            self.navigate_back();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.forward_history.is_empty(),
+                                egui::Button::new(if compact { "↷" } else { "Forward →" }),
+                            )
+                            .on_hover_text("Go forward again (Alt+Right)")
+                            .clicked()
+                        {
+                            self.navigate_forward();
+                        }
+                        ui.separator();
 
-                if ui
-                    .add_enabled(
-                        has_document && self.current_page > 0,
-                        egui::Button::new("◀"),
-                    )
-                    .on_hover_text("Previous page (Page Up)")
-                    .clicked()
-                {
-                    self.go_to_page(self.current_page - 1);
-                }
-                let page_response = ui.add_enabled(
-                    has_document,
-                    egui::TextEdit::singleline(&mut self.page_input).desired_width(46.0),
-                );
-                if page_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                    if let Ok(page) = self.page_input.trim().parse::<usize>() {
-                        self.go_to_page(page.saturating_sub(1));
-                    } else {
-                        self.page_input = (self.current_page + 1).to_string();
-                    }
-                }
-                ui.label(format!("/ {}", self.page_count().max(1)));
-                if ui
-                    .add_enabled(
-                        has_document && self.current_page + 1 < self.page_count(),
-                        egui::Button::new("▶"),
-                    )
-                    .on_hover_text("Next page (Page Down)")
-                    .clicked()
-                {
-                    self.go_to_page(self.current_page + 1);
-                }
-                ui.separator();
+                        if ui
+                            .add_enabled(
+                                has_document && self.current_page > 0,
+                                egui::Button::new("◀"),
+                            )
+                            .on_hover_text("Previous page (Page Up)")
+                            .clicked()
+                        {
+                            self.go_to_page(self.current_page - 1);
+                        }
+                        let page_response = ui.add_enabled(
+                            has_document,
+                            egui::TextEdit::singleline(&mut self.page_input).desired_width(46.0),
+                        );
+                        if page_response.lost_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter))
+                        {
+                            if let Ok(page) = self.page_input.trim().parse::<usize>() {
+                                self.go_to_page(page.saturating_sub(1));
+                            } else {
+                                self.page_input = (self.current_page + 1).to_string();
+                            }
+                        }
+                        ui.label(format!("/ {}", self.page_count().max(1)));
+                        if ui
+                            .add_enabled(
+                                has_document && self.current_page + 1 < self.page_count(),
+                                egui::Button::new("▶"),
+                            )
+                            .on_hover_text("Next page (Page Down)")
+                            .clicked()
+                        {
+                            self.go_to_page(self.current_page + 1);
+                        }
+                        ui.separator();
 
-                if ui
-                    .add_enabled(has_document, egui::Button::new("−"))
-                    .clicked()
-                {
-                    self.set_manual_zoom(self.effective_zoom() - 0.1);
-                }
-                let mut percent = (self.effective_zoom() * 100.0).round();
-                if ui
-                    .add_enabled(
-                        has_document,
-                        egui::DragValue::new(&mut percent)
-                            .range(25.0..=400.0)
-                            .speed(1.0)
-                            .suffix("%"),
-                    )
-                    .changed()
-                {
-                    self.set_manual_zoom(percent / 100.0);
-                }
-                if ui
-                    .add_enabled(has_document, egui::Button::new("+"))
-                    .clicked()
-                {
-                    self.set_manual_zoom(self.effective_zoom() + 0.1);
-                }
-                if ui
-                    .add_enabled(
-                        has_document,
-                        egui::Button::selectable(self.zoom == ZoomMode::FitWidth, "Fit width"),
-                    )
-                    .clicked()
-                {
-                    self.zoom = ZoomMode::FitWidth;
-                    self.schedule_render(false);
-                }
-                if ui
-                    .add_enabled(
-                        has_document,
-                        egui::Button::selectable(self.zoom == ZoomMode::FitPage, "Fit page"),
-                    )
-                    .clicked()
-                {
-                    self.zoom = ZoomMode::FitPage;
-                    self.schedule_render(false);
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        has_document,
-                        egui::Button::selectable(self.show_notes, "Notes"),
-                    )
-                    .clicked()
-                {
-                    self.show_notes = !self.show_notes;
-                }
+                        if ui
+                            .add_enabled(has_document, egui::Button::new("−"))
+                            .clicked()
+                        {
+                            self.set_manual_zoom(self.effective_zoom() - 0.1);
+                        }
+                        let mut percent = (self.effective_zoom() * 100.0).round();
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::DragValue::new(&mut percent)
+                                    .range(25.0..=400.0)
+                                    .speed(1.0)
+                                    .suffix("%"),
+                            )
+                            .changed()
+                        {
+                            self.set_manual_zoom(percent / 100.0);
+                        }
+                        if ui
+                            .add_enabled(has_document, egui::Button::new("+"))
+                            .clicked()
+                        {
+                            self.set_manual_zoom(self.effective_zoom() + 0.1);
+                        }
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::selectable(
+                                    self.zoom == ZoomMode::FitWidth,
+                                    if compact { "Width" } else { "Fit width" },
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.zoom = ZoomMode::FitWidth;
+                            self.schedule_render(false);
+                        }
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::selectable(
+                                    self.zoom == ZoomMode::FitPage,
+                                    if compact { "Page" } else { "Fit page" },
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.zoom = ZoomMode::FitPage;
+                            self.schedule_render(false);
+                        }
+                        ui.separator();
+                        let previous_layout = self.layout;
+                        ui.add_enabled_ui(has_document, |ui| {
+                            ui.selectable_value(
+                                &mut self.layout,
+                                LayoutMode::SinglePage,
+                                if compact { "1 page" } else { "Single" },
+                            );
+                            ui.selectable_value(
+                                &mut self.layout,
+                                LayoutMode::Continuous,
+                                if compact { "Scroll" } else { "Continuous" },
+                            );
+                        });
+                        if self.layout != previous_layout {
+                            if self.layout == LayoutMode::Continuous {
+                                self.pending_page_scroll = Some(self.current_page);
+                                self.pending_scroll = None;
+                            } else {
+                                self.pending_page_scroll = None;
+                                self.pending_scroll = Some(Vec2::ZERO);
+                            }
+                            self.selection_draft = None;
+                            self.drag_page = None;
+                            self.schedule_render(true);
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::selectable(self.show_notes, "Notes"),
+                            )
+                            .clicked()
+                        {
+                            self.show_notes = !self.show_notes;
+                        }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some((_, path)) = self.loading.as_ref() {
-                        ui.spinner();
-                        ui.label(format!("Opening {}", file_name(path)));
-                    } else if let Some(status) = self.status.as_ref() {
-                        let color = if status.is_error {
-                            Color32::from_rgb(255, 145, 135)
-                        } else {
-                            Color32::from_gray(180)
-                        };
-                        ui.label(RichText::new(&status.text).color(color));
-                    }
+                        if let Some((_, path)) = self.loading.as_ref() {
+                            ui.separator();
+                            ui.spinner();
+                            if !compact {
+                                ui.label(format!("Opening {}", file_name(path)));
+                            }
+                        } else if let Some(status) = self
+                            .status
+                            .as_ref()
+                            .filter(|status| !compact || status.is_error)
+                        {
+                            let color = if status.is_error {
+                                Color32::from_rgb(255, 145, 135)
+                            } else {
+                                Color32::from_gray(180)
+                            };
+                            ui.separator();
+                            ui.label(RichText::new(&status.text).color(color));
+                        }
+                    });
                 });
-            });
         });
     }
 
@@ -654,7 +751,7 @@ impl PdfViewerApp {
             .show(root_ui, |ui| {
                 ui.heading(format!("Notes — page {}", self.current_page + 1));
                 ui.label(
-                    RichText::new("Select text, then choose Add note.")
+                    RichText::new("Select text, then right-click and choose Add note.")
                         .small()
                         .weak(),
                 );
@@ -754,7 +851,7 @@ impl PdfViewerApp {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(27, 29, 33)))
             .show(root_ui, |ui| {
                 self.last_viewport = ui.available_size();
-                let Some(document) = self.document.as_ref() else {
+                if self.document.is_none() {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
                             ui.heading("Simple PDF Viewer");
@@ -765,7 +862,14 @@ impl PdfViewerApp {
                         });
                     });
                     return;
-                };
+                }
+
+                if self.layout == LayoutMode::Continuous {
+                    self.continuous_document(ui, ctx);
+                    return;
+                }
+
+                let document = self.document.as_ref().expect("document checked above");
 
                 let generation = document.generation;
                 let page_size = document.page_sizes[self.current_page];
@@ -806,7 +910,14 @@ impl PdfViewerApp {
                 let drag_rect = self
                     .drag_start
                     .zip(self.drag_current)
+                    .filter(|_| self.drag_page == Some(self.current_page))
                     .map(|(start, current)| NormalizedRect::from_points(start, current));
+                let selected_rects = self
+                    .selection_draft
+                    .as_ref()
+                    .filter(|draft| draft.page_index == self.current_page)
+                    .map(|draft| draft.rects.clone())
+                    .unwrap_or_default();
 
                 let mut requested_offset = self.pending_scroll.take();
                 if let Some(destination) = self.pending_destination.take()
@@ -824,7 +935,7 @@ impl PdfViewerApp {
                 }
 
                 let mut scroll_area = egui::ScrollArea::both()
-                    .id_salt("document-scroll")
+                    .id_salt("document-scroll-single")
                     .auto_shrink([false, false]);
                 if let Some(offset) = requested_offset {
                     scroll_area = scroll_area.scroll_offset(offset);
@@ -878,6 +989,13 @@ impl PdfViewerApp {
                             painter.rect_filled(rect_to_screen(*rect, page_rect), 1.0, color);
                         }
                     }
+                    for rect in &selected_rects {
+                        painter.rect_filled(
+                            rect_to_screen(*rect, page_rect),
+                            1.0,
+                            Color32::from_rgba_unmultiplied(70, 140, 255, 82),
+                        );
+                    }
                     if let Some(rect) = drag_rect {
                         painter.rect_filled(
                             rect_to_screen(rect, page_rect),
@@ -890,7 +1008,14 @@ impl PdfViewerApp {
                 });
                 self.current_scroll = output.state.offset;
                 let (response, page_rect) = output.inner;
-                self.handle_page_interaction(ctx, &response, page_rect, &links, &annotations);
+                self.handle_page_interaction(
+                    ctx,
+                    self.current_page,
+                    &response,
+                    page_rect,
+                    &links,
+                    &annotations,
+                );
             });
     }
 
@@ -908,30 +1033,246 @@ impl PdfViewerApp {
         }
     }
 
+    fn continuous_document(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let document = self.document.as_ref().expect("document checked above");
+        let generation = document.generation;
+        let page_sizes = document.page_sizes.clone();
+        let annotations = document.annotations.annotations().to_vec();
+        let display_sizes: Vec<Vec2> = page_sizes
+            .iter()
+            .map(|page_size| {
+                let scale = self.display_scale(*page_size, self.last_viewport);
+                vec2(page_size[0] * scale, page_size[1] * scale)
+            })
+            .collect();
+        let mut page_tops = Vec::with_capacity(display_sizes.len());
+        let mut next_top = PAGE_MARGIN;
+        for size in &display_sizes {
+            page_tops.push(next_top);
+            next_top += size.y + PAGE_GAP;
+        }
+        let canvas_width = (display_sizes.iter().map(|size| size.x).fold(0.0, f32::max)
+            + PAGE_MARGIN * 2.0)
+            .max(self.last_viewport.x);
+        let canvas_height = (next_top - PAGE_GAP + PAGE_MARGIN).max(self.last_viewport.y);
+
+        let requested_offset = self.pending_scroll.take();
+        let requested_page = self.pending_page_scroll.take();
+        let requested_destination = self.pending_destination.take();
+        let selected_annotation = self.selected_annotation;
+        let selected_page = self.selection_draft.as_ref().map(|draft| draft.page_index);
+        let selected_rects = self
+            .selection_draft
+            .as_ref()
+            .map(|draft| draft.rects.clone())
+            .unwrap_or_default();
+        let drag_page = self.drag_page;
+        let drag_rect = self
+            .drag_start
+            .zip(self.drag_current)
+            .map(|(start, current)| NormalizedRect::from_points(start, current));
+
+        let mut scroll_area = egui::ScrollArea::both()
+            .id_salt("document-scroll-continuous")
+            .auto_shrink([false, false]);
+        if let Some(offset) = requested_offset {
+            scroll_area = scroll_area.scroll_offset(offset);
+        }
+
+        let mut requested_renders = Vec::new();
+        let mut interactions = Vec::new();
+        let output = scroll_area.show_viewport(ui, |ui, viewport| {
+            ui.set_min_size(vec2(canvas_width, canvas_height));
+            let origin = ui.min_rect().min;
+            let prefetch_viewport = viewport.expand2(vec2(0.0, viewport.height()));
+
+            for (page_index, display_size) in display_sizes.iter().copied().enumerate() {
+                let page_min = origin
+                    + vec2(
+                        ((canvas_width - display_size.x) * 0.5).max(PAGE_MARGIN),
+                        page_tops[page_index],
+                    );
+                let page_rect = Rect::from_min_size(page_min, display_size);
+                let logical_page_rect = Rect::from_min_size(
+                    pos2(page_min.x - origin.x, page_tops[page_index]),
+                    display_size,
+                );
+
+                if requested_page == Some(page_index) {
+                    let target = Rect::from_min_size(
+                        pos2(origin.x, page_rect.top()),
+                        vec2(canvas_width, 1.0),
+                    );
+                    ui.scroll_to_rect(target, Some(Align::Min));
+                }
+                if let Some(destination) = requested_destination.as_ref()
+                    && destination.page_index == page_index
+                {
+                    let page_scale = display_size.x / page_sizes[page_index][0];
+                    let y = page_rect.top() + destination.y_from_top.unwrap_or(0.0) * page_scale;
+                    let target = Rect::from_min_size(pos2(origin.x, y), vec2(canvas_width, 1.0));
+                    ui.scroll_to_rect(target, Some(Align::Center));
+                }
+
+                if !logical_page_rect.intersects(prefetch_viewport) {
+                    continue;
+                }
+
+                let key = render_key(generation, page_index, display_size, ctx.pixels_per_point());
+                requested_renders.push(key);
+                let cache = self
+                    .page_cache
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .or_else(|| {
+                        self.page_cache.iter().find(|entry| {
+                            entry.key.generation == generation && entry.key.page_index == page_index
+                        })
+                    });
+                let texture = cache.map(|entry| entry.texture.clone());
+                let links = cache.map(|entry| entry.links.clone()).unwrap_or_default();
+                let page_annotations: Vec<_> = annotations
+                    .iter()
+                    .filter(|annotation| annotation.page_index == page_index)
+                    .cloned()
+                    .collect();
+
+                let response = ui.interact(
+                    page_rect,
+                    Id::new(("pdf-page", page_index)),
+                    Sense::click_and_drag(),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(
+                    page_rect.translate(vec2(4.0, 5.0)),
+                    2.0,
+                    Color32::from_black_alpha(90),
+                );
+                painter.rect_filled(page_rect, 1.0, Color32::WHITE);
+                if let Some(texture) = texture.as_ref() {
+                    painter.image(
+                        texture.id(),
+                        page_rect,
+                        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    painter.text(
+                        page_rect.center(),
+                        Align2::CENTER_CENTER,
+                        format!("Rendering page {}…", page_index + 1),
+                        egui::FontId::proportional(16.0),
+                        Color32::DARK_GRAY,
+                    );
+                }
+
+                for annotation in &page_annotations {
+                    let color = if selected_annotation == Some(annotation.id) {
+                        Color32::from_rgba_unmultiplied(255, 190, 20, 105)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 224, 50, 72)
+                    };
+                    for rect in &annotation.rects {
+                        painter.rect_filled(rect_to_screen(*rect, page_rect), 1.0, color);
+                    }
+                }
+                if selected_page == Some(page_index) {
+                    for rect in &selected_rects {
+                        painter.rect_filled(
+                            rect_to_screen(*rect, page_rect),
+                            1.0,
+                            Color32::from_rgba_unmultiplied(70, 140, 255, 82),
+                        );
+                    }
+                }
+                if drag_page == Some(page_index)
+                    && let Some(rect) = drag_rect
+                {
+                    painter.rect_filled(
+                        rect_to_screen(rect, page_rect),
+                        1.0,
+                        Color32::from_rgba_unmultiplied(70, 140, 255, 55),
+                    );
+                }
+                interactions.push((page_index, response, page_rect, links, page_annotations));
+            }
+        });
+
+        self.current_scroll = output.state.offset;
+        let reading_position = self.current_scroll.y + self.last_viewport.y * 0.35;
+        if let Some((page_index, _)) = page_tops.iter().enumerate().min_by(
+            |(left_index, left_top), (right_index, right_top)| {
+                let left_center = **left_top + display_sizes[*left_index].y * 0.5;
+                let right_center = **right_top + display_sizes[*right_index].y * 0.5;
+                (left_center - reading_position)
+                    .abs()
+                    .total_cmp(&(right_center - reading_position).abs())
+            },
+        ) && page_index != self.current_page
+        {
+            self.current_page = page_index;
+            self.page_input = (page_index + 1).to_string();
+            self.selected_annotation = None;
+        }
+
+        for key in requested_renders {
+            self.request_render(key);
+        }
+        if !interactions
+            .iter()
+            .any(|(_, response, _, _, _)| response.hovered())
+        {
+            self.hover = None;
+        }
+        for (page_index, response, page_rect, links, page_annotations) in interactions {
+            self.handle_page_interaction(
+                ctx,
+                page_index,
+                &response,
+                page_rect,
+                &links,
+                &page_annotations,
+            );
+        }
+    }
+
+    fn request_render(&mut self, key: RenderKey) {
+        let already_cached = self.page_cache.iter().any(|entry| entry.key == key);
+        if !already_cached && !self.pending_renders.contains(&key) && self.pending_renders.len() < 4
+        {
+            self.pending_renders.insert(key);
+            self.backend
+                .render_page(key.generation, key.page_index, key.pixel_size);
+        }
+    }
+
     fn handle_page_interaction(
         &mut self,
         ctx: &egui::Context,
+        page_index: usize,
         response: &egui::Response,
         page_rect: Rect,
         links: &[LinkRegion],
         annotations: &[crate::annotations::Annotation],
     ) {
         let pointer = response.interact_pointer_pos();
-        if response.drag_started()
+        if response.drag_started_by(PointerButton::Primary)
             && let Some(pointer) = pointer
         {
             let normalized = point_to_normalized(pointer, page_rect);
             self.drag_start = Some(normalized);
             self.drag_current = Some(normalized);
+            self.drag_page = Some(page_index);
             self.selection_draft = None;
             self.hover = None;
         }
-        if response.dragged()
+        if response.dragged_by(PointerButton::Primary)
+            && self.drag_page == Some(page_index)
             && let Some(pointer) = pointer
         {
             self.drag_current = Some(point_to_normalized(pointer, page_rect));
         }
-        if response.drag_stopped() {
+        if response.drag_stopped_by(PointerButton::Primary) && self.drag_page == Some(page_index) {
             if let Some((start, end)) = self.drag_start.zip(self.drag_current) {
                 let selection = NormalizedRect::from_points(start, end);
                 if selection.width * page_rect.width() > 3.0
@@ -943,14 +1284,16 @@ impl PdfViewerApp {
                         self.backend.resolve_selection(
                             generation,
                             self.selection_request,
-                            self.current_page,
-                            selection,
+                            page_index,
+                            start,
+                            end,
                         );
                     }
                 }
             }
             self.drag_start = None;
             self.drag_current = None;
+            self.drag_page = None;
         }
 
         let hover_point = response
@@ -958,7 +1301,7 @@ impl PdfViewerApp {
             .map(|pointer| point_to_normalized(pointer, page_rect));
         let hovered_link = hover_point
             .and_then(|point| links.iter().find(|link| link.rect.contains(point)).cloned());
-        if response.dragged() {
+        if response.dragged_by(PointerButton::Primary) {
             self.hover = None;
         } else if let Some(link) = hovered_link.as_ref() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
@@ -972,8 +1315,9 @@ impl PdfViewerApp {
                     started: Instant::now(),
                 });
             }
-        } else {
+        } else if response.hovered() {
             self.hover = None;
+            ctx.set_cursor_icon(CursorIcon::Text);
         }
 
         if response.clicked()
@@ -990,51 +1334,79 @@ impl PdfViewerApp {
                 .iter()
                 .find(|annotation| annotation.rects.iter().any(|rect| rect.contains(point)))
             {
+                self.current_page = page_index;
+                self.page_input = (page_index + 1).to_string();
                 self.selected_annotation = Some(annotation.id);
                 self.show_notes = true;
             } else {
                 self.selected_annotation = None;
             }
         }
+
+        let selected_text = self
+            .selection_draft
+            .as_ref()
+            .filter(|draft| draft.page_index == page_index)
+            .map(|draft| draft.text.clone());
+        let mut selection_action = None;
+        response.context_menu(|ui| {
+            if let Some(text) = selected_text.as_ref() {
+                ui.set_max_width(360.0);
+                ui.label(RichText::new(compact_text(text, 140)).italics().weak());
+                ui.separator();
+                if ui.button("Copy text").clicked() {
+                    selection_action = Some(SelectionAction::Copy);
+                    ui.close();
+                }
+                if ui.button("Highlight").clicked() {
+                    selection_action = Some(SelectionAction::Highlight);
+                    ui.close();
+                }
+                if ui.button("Add note").clicked() {
+                    selection_action = Some(SelectionAction::AddNote);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Clear selection").clicked() {
+                    selection_action = Some(SelectionAction::Clear);
+                    ui.close();
+                }
+            } else if self.selection_waiting.is_some() {
+                ui.spinner();
+                ui.label("Reading selected text…");
+            } else {
+                ui.label("Drag across text first, then right-click it.");
+            }
+        });
+        self.apply_selection_action(ctx, selection_action);
     }
 
-    fn selection_popup(&mut self, ctx: &egui::Context) {
-        let Some(draft) = self.selection_draft.as_ref() else {
-            return;
-        };
-        let preview = compact_text(&draft.text, 160);
-        let mut action = None;
-        egui::Window::new("Selected text")
-            .id(Id::new("selection-actions"))
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -18.0))
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(RichText::new(preview).italics());
-                ui.horizontal(|ui| {
-                    if ui.button("Highlight").clicked() {
-                        action = Some(false);
-                    }
-                    if ui.button("Add note").clicked() {
-                        action = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.selection_draft = None;
-                    }
-                });
-            });
-        if let Some(add_note) = action {
-            let draft = self.selection_draft.take().expect("draft exists");
-            if let Some(document) = self.document.as_mut() {
-                let id = document
-                    .annotations
-                    .add(draft.page_index, draft.rects, draft.text);
-                if add_note {
-                    self.selected_annotation = Some(id);
-                    self.show_notes = true;
+    fn apply_selection_action(&mut self, ctx: &egui::Context, action: Option<SelectionAction>) {
+        match action {
+            Some(SelectionAction::Copy) => {
+                if let Some(draft) = self.selection_draft.as_ref() {
+                    ctx.copy_text(draft.text.clone());
+                    self.set_status("Copied selected text.", false);
                 }
             }
+            Some(SelectionAction::Highlight | SelectionAction::AddNote) => {
+                let add_note = matches!(action, Some(SelectionAction::AddNote));
+                if let Some(draft) = self.selection_draft.take()
+                    && let Some(document) = self.document.as_mut()
+                {
+                    let id = document
+                        .annotations
+                        .add(draft.page_index, draft.rects, draft.text);
+                    if add_note {
+                        self.current_page = draft.page_index;
+                        self.page_input = (draft.page_index + 1).to_string();
+                        self.selected_annotation = Some(id);
+                        self.show_notes = true;
+                    }
+                }
+            }
+            Some(SelectionAction::Clear) => self.selection_draft = None,
+            None => {}
         }
     }
 
@@ -1149,9 +1521,10 @@ impl eframe::App for PdfViewerApp {
         self.toolbar(ui);
         self.notes_panel(ui);
         self.central_panel(ui, &ctx);
-        self.selection_popup(&ctx);
         self.hover_preview(&ctx);
-        self.send_render_if_due();
+        if self.layout == LayoutMode::SinglePage {
+            self.send_render_if_due();
+        }
         self.save_annotations(&ctx);
 
         if self.loading.is_some()

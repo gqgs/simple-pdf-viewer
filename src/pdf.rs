@@ -124,7 +124,8 @@ enum PdfCommand {
         generation: u64,
         request_id: u64,
         page_index: usize,
-        selection: NormalizedRect,
+        start: [f32; 2],
+        end: [f32; 2],
     },
     Quit,
 }
@@ -182,13 +183,15 @@ impl PdfBackend {
         generation: u64,
         request_id: u64,
         page_index: usize,
-        selection: NormalizedRect,
+        start: [f32; 2],
+        end: [f32; 2],
     ) {
         let _ = self.command_tx.send(PdfCommand::ResolveSelection {
             generation,
             request_id,
             page_index,
-            selection,
+            start,
+            end,
         });
     }
 
@@ -277,7 +280,8 @@ fn worker_loop(command_rx: Receiver<PdfCommand>, response_tx: Sender<PdfResponse
                 generation,
                 request_id,
                 page_index,
-                selection,
+                start,
+                end,
             } => {
                 let Some(state) = loaded
                     .as_ref()
@@ -285,7 +289,7 @@ fn worker_loop(command_rx: Receiver<PdfCommand>, response_tx: Sender<PdfResponse
                 else {
                     continue;
                 };
-                let result = resolve_selection(&state.document, page_index, selection).map(
+                let result = resolve_selection(&state.document, page_index, start, end).map(
                     |(text, rects)| PdfResponse::SelectionResolved {
                         generation,
                         request_id,
@@ -475,17 +479,21 @@ fn render_surface(
 fn resolve_selection(
     document: &Document,
     page_index: usize,
-    selection: NormalizedRect,
+    start: [f32; 2],
+    end: [f32; 2],
 ) -> Result<(String, Vec<NormalizedRect>), String> {
     let page = document
         .page(page_index as i32)
         .ok_or_else(|| "selection page does not exist".to_owned())?;
     let (page_width, page_height) = page.size();
     let mut pdf_rect = poppler::Rectangle::new();
-    pdf_rect.set_x1(f64::from(selection.x) * page_width);
-    pdf_rect.set_x2(f64::from(selection.x + selection.width) * page_width);
-    pdf_rect.set_y1(f64::from(1.0 - selection.y - selection.height) * page_height);
-    pdf_rect.set_y2(f64::from(1.0 - selection.y) * page_height);
+    // Poppler's text APIs use top-left page coordinates and interpret x1/y1 and x2/y2 as
+    // selection anchors, not merely the corners of an unordered bounding box. Preserve the
+    // user's drag direction so backward and multi-line selections resolve predictably.
+    pdf_rect.set_x1(f64::from(start[0]) * page_width);
+    pdf_rect.set_y1(f64::from(start[1]) * page_height);
+    pdf_rect.set_x2(f64::from(end[0]) * page_width);
+    pdf_rect.set_y2(f64::from(end[1]) * page_height);
     let text = page
         .selected_text(SelectionStyle::Word, &mut pdf_rect)
         .map(|text| text.trim().to_owned())
@@ -668,19 +676,20 @@ mod tests {
             "rendered page should contain non-white content"
         );
 
-        let (text, rects) = resolve_selection(
-            &state.document,
-            0,
-            NormalizedRect {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            },
-        )
-        .expect("selection should resolve");
+        let (text, rects) = resolve_selection(&state.document, 0, [0.0, 0.0], [1.0, 1.0])
+            .expect("selection should resolve");
         assert!(text.contains("Ingressing Minds"));
         assert!(!rects.is_empty());
+
+        let title_start = [0.06, 0.135];
+        let title_end = [0.86, 0.185];
+        for (start, end) in [(title_start, title_end), (title_end, title_start)] {
+            let (title, title_rects) = resolve_selection(&state.document, 0, start, end)
+                .expect("directed title selection should resolve");
+            assert!(title.contains("Ingressing Minds"));
+            assert!(!title.contains("Abstract"));
+            assert!(!title_rects.is_empty());
+        }
 
         let internal_destination = (0..state.document.n_pages())
             .find_map(|page_index| {
