@@ -23,6 +23,9 @@ const MAX_ZOOM: f32 = 4.0;
 const PAGE_MARGIN: f32 = 24.0;
 const PAGE_GAP: f32 = 18.0;
 const KEYBOARD_SCROLL_STEP: f32 = 96.0;
+// Fractional window and desktop scales otherwise force the GPU to interpolate a texture rendered
+// at almost exactly its display size, which noticeably softens small glyphs.
+const RENDER_OVERSAMPLE: f32 = 1.5;
 const MAX_RENDER_PIXELS: f64 = 24_000_000.0;
 const MAX_TEXTURE_SIDE: f64 = 8_192.0;
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(110);
@@ -1581,8 +1584,9 @@ fn render_key(
     display_size: Vec2,
     pixels_per_point: f32,
 ) -> RenderKey {
-    let mut width = f64::from(display_size.x * pixels_per_point).max(1.0);
-    let mut height = f64::from(display_size.y * pixels_per_point).max(1.0);
+    let render_scale = pixels_per_point * RENDER_OVERSAMPLE;
+    let mut width = f64::from(display_size.x * render_scale).max(1.0);
+    let mut height = f64::from(display_size.y * render_scale).max(1.0);
     let side_scale = (MAX_TEXTURE_SIDE / width)
         .min(MAX_TEXTURE_SIDE / height)
         .min(1.0);
@@ -1652,6 +1656,12 @@ mod tests {
         assert!(key.pixel_size[0] <= MAX_TEXTURE_SIDE as usize);
         assert!(key.pixel_size[1] <= MAX_TEXTURE_SIDE as usize);
         assert!(key.pixel_size[0] * key.pixel_size[1] <= MAX_RENDER_PIXELS as usize + 20_000);
+    }
+
+    #[test]
+    fn render_size_includes_quality_margin() {
+        let key = render_key(1, 0, vec2(800.0, 1_000.0), 1.0);
+        assert_eq!(key.pixel_size, [1_200, 1_500]);
     }
 
     #[test]
