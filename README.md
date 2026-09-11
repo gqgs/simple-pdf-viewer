@@ -44,6 +44,8 @@ You can also drop a PDF into the application window.
 | Action | Control |
 | --- | --- |
 | Open PDF | `Ctrl+O` |
+| Previous / next page | `Left Arrow` / `Right Arrow` |
+| Scroll up / down | `Up Arrow` / `Down Arrow` |
 | Previous / next page | `Page Up` / `Page Down` |
 | First / last page | `Home` / `End` |
 | Return after following a reference | `Alt+Left` or **Back** |

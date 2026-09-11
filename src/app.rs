@@ -22,6 +22,7 @@ const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 4.0;
 const PAGE_MARGIN: f32 = 24.0;
 const PAGE_GAP: f32 = 18.0;
+const KEYBOARD_SCROLL_STEP: f32 = 96.0;
 const MAX_RENDER_PIXELS: f64 = 24_000_000.0;
 const MAX_TEXTURE_SIDE: f64 = 8_192.0;
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(110);
@@ -110,6 +111,7 @@ pub struct PdfViewerApp {
     layout: LayoutMode,
     last_viewport: Vec2,
     current_scroll: Vec2,
+    keyboard_scroll_delta: Vec2,
     pending_scroll: Option<Vec2>,
     pending_page_scroll: Option<usize>,
     pending_destination: Option<Destination>,
@@ -152,6 +154,7 @@ impl PdfViewerApp {
             layout: LayoutMode::SinglePage,
             last_viewport: vec2(900.0, 700.0),
             current_scroll: Vec2::ZERO,
+            keyboard_scroll_delta: Vec2::ZERO,
             pending_scroll: None,
             pending_page_scroll: None,
             pending_destination: None,
@@ -526,6 +529,18 @@ impl PdfViewerApp {
         }
 
         if !ctx.egui_wants_keyboard_input() {
+            if shortcut(Modifiers::NONE, Key::ArrowLeft) {
+                self.go_to_page(self.current_page.saturating_sub(1));
+            }
+            if shortcut(Modifiers::NONE, Key::ArrowRight) {
+                self.go_to_page(self.current_page.saturating_add(1));
+            }
+            if shortcut(Modifiers::NONE, Key::ArrowUp) {
+                self.keyboard_scroll_delta.y += KEYBOARD_SCROLL_STEP;
+            }
+            if shortcut(Modifiers::NONE, Key::ArrowDown) {
+                self.keyboard_scroll_delta.y -= KEYBOARD_SCROLL_STEP;
+            }
             if ctx.input(|input| input.key_pressed(Key::PageUp)) {
                 self.go_to_page(self.current_page.saturating_sub(1));
             }
@@ -941,7 +956,9 @@ impl PdfViewerApp {
                     scroll_area = scroll_area.scroll_offset(offset);
                 }
 
+                let keyboard_scroll_delta = std::mem::take(&mut self.keyboard_scroll_delta);
                 let output = scroll_area.show_viewport(ui, |ui, viewport| {
+                    ui.scroll_with_delta(keyboard_scroll_delta);
                     let canvas_size = vec2(
                         display_size.x.max(viewport.width()) + PAGE_MARGIN * 2.0,
                         display_size.y.max(viewport.height()) + PAGE_MARGIN * 2.0,
@@ -1079,9 +1096,11 @@ impl PdfViewerApp {
             scroll_area = scroll_area.scroll_offset(offset);
         }
 
+        let keyboard_scroll_delta = std::mem::take(&mut self.keyboard_scroll_delta);
         let mut requested_renders = Vec::new();
         let mut interactions = Vec::new();
         let output = scroll_area.show_viewport(ui, |ui, viewport| {
+            ui.scroll_with_delta(keyboard_scroll_delta);
             ui.set_min_size(vec2(canvas_width, canvas_height));
             let origin = ui.min_rect().min;
             let prefetch_viewport = viewport.expand2(vec2(0.0, viewport.height()));
