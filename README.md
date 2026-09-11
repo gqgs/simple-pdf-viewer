@@ -39,6 +39,22 @@ cargo run --release -- sample.pdf
 
 You can also drop a PDF into the application window.
 
+## Install
+
+Install the optimized binary, application icon, and desktop launcher for the current user:
+
+```sh
+make install
+```
+
+This installs under `~/.local` by default: the executable goes to `~/.local/bin`, while the icon and `.desktop` file go to the appropriate directories under `~/.local/share`. Ensure `~/.local/bin` is on the desktop session's `PATH`.
+
+For a different installation prefix, for example when packaging system-wide, run:
+
+```sh
+make install PREFIX=/usr/local
+```
+
 ## Controls
 
 | Action | Control |

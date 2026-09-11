@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Simple PDF Viewer
+Comment=Read and annotate PDF documents
+Exec=simple-pdf-viewer %f
+Icon=simple-pdf-viewer
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true
+StartupWMClass=simple-pdf-viewer
+Keywords=PDF;Viewer;Reader;Highlight;Notes;
